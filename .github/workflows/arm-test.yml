@@ -1,47 +1,68 @@
-name: ARM64 Test
+name: ARM64 Tests and Benchmark
 
 on:
-  workflow_dispatch:
   push:
     branches:
       - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
 
 jobs:
   arm64:
+    name: ARM64 Tests and Benchmark
     runs-on: ubuntu-24.04-arm
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Check architecture
-        run: |
-          uname -m
-          lscpu | grep -E "Architecture|Model name|CPU\(s\)"
-
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Verify ARM64 architecture
+        run: |
+          echo "=== Architecture ==="
+          uname -m
+
+          echo "=== CPU Information ==="
+          lscpu
+
+          echo "=== Python Architecture ==="
+          python -c "import platform; print(platform.machine())"
+
+          python -c "import platform; assert platform.machine() in ('aarch64', 'arm64'), f'Not ARM64: {platform.machine()}'"
+
+      - name: Upgrade pip
         run: |
           python -m pip install --upgrade pip
+
+      - name: Install dependencies
+        run: |
           pip install -r requirements.txt
 
-      - name: Install TensorFold
+      - name: Install TensorFold-arm
         run: |
           pip install -e .
 
-      - name: Verify ARM64
+      - name: Verify TensorFold installation
         run: |
-          python -c "import platform; print('Architecture:', platform.machine())"
+          python -c "import tensorfold; print('TensorFold imported successfully')"
 
-      - name: Verify TensorFold
+      - name: Verify benchmark model
         run: |
-          python -c "import tensorfold; print('TensorFold import OK')"
-          python -c "import tensorfold; print(tensorfold.__file__)"
+          echo "Checking for mnist_mlp.pt..."
+          ls -lh mnist_mlp.pt
+          test -f mnist_mlp.pt
+          echo "mnist_mlp.pt found successfully"
 
-      - name: Run benchmark
+      - name: Run tests
+        run: |
+          pytest tests -v
+
+      - name: Run ARM64 benchmark
         run: |
           python examples/benchmark_tensorfold.py
