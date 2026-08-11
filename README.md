@@ -1,484 +1,296 @@
 # TensorFold-arm
 
-TensorFold-arm is an Arm-focused neural network optimization project that reduces the parameter and computational cost of dense neural-network `Linear` layers using SVD-based low-rank matrix decomposition.
+TensorFold-arm is an Arm-focused neural network optimization project that reduces the computational and parameter cost of dense neural network layers using low-rank matrix decomposition.
 
-The project targets CPU inference on **Arm64 platforms** and provides an automatic compression pipeline for PyTorch models.
+The project targets CPU inference on Arm64 platforms and provides an automatic model compression pipeline for PyTorch models.
 
 > **TensorFold-arm is an independent project created specifically for the Arm AI Optimization Challenge.**
 >
-> It is not part of MiniPyPy and does not depend on the existing MiniPyPy TensorFold implementation.
+> It is not part of MiniPyPy and does not depend on the existing MiniPyPy TensorFold implementation. Ideas and optimizations developed here may be integrated into the main project in the future.
 
 ---
 
 ## Table of Contents
 
 - [Overview](#overview)
-- [The Problem](#the-problem)
 - [Core Idea](#core-idea)
+- [Why Low-Rank Compression](#why-low-rank-compression)
 - [Mathematical Foundation](#mathematical-foundation)
-- [Parameter Compression](#parameter-compression)
-- [SVD-Based Decomposition](#svd-based-decomposition)
-- [Energy-Based Rank Selection](#energy-based-rank-selection)
-- [Inference Computation](#inference-computation)
-- [Architecture](#architecture)
+  - [Dense Linear Layer](#dense-linear-layer)
+  - [SVD Decomposition](#svd-decomposition)
+  - [Rank Truncation](#rank-truncation)
+  - [TensorFold Factorization](#tensorfold-factorization)
+  - [Parameter Reduction](#parameter-reduction)
+  - [Example](#example)
+  - [Energy-Based Rank Selection](#energy-based-rank-selection)
 - [How TensorFold Works](#how-tensorfold-works)
-- [Code Architecture](#code-architecture)
+- [Architecture](#architecture)
 - [Project Structure](#project-structure)
 - [Installation](#installation)
 - [Usage](#usage)
-- [Automatic Model Compression](#automatic-model-compression)
-- [Running Tests](#running-tests)
-- [Benchmark Methodology](#benchmark-methodology)
-- [ARM64 Benchmark Results](#arm64-benchmark-results)
-- [x86 Reference Benchmark](#x86-reference-benchmark)
-- [Accuracy Results](#accuracy-results)
-- [Results Summary](#results-summary)
+- [Compression API](#compression-api)
+- [TensorFoldLinear](#tensorfoldlinear)
+- [Compression Analysis](#compression-analysis)
+- [Benchmark Model](#benchmark-model)
+- [Benchmark Configuration](#benchmark-configuration)
+- [Benchmark Results](#benchmark-results)
+- [AMD64 Reference Benchmark](#amd64-reference-benchmark)
+- [Native ARM64 Benchmark](#native-arm64-benchmark)
+- [Benchmark Interpretation](#benchmark-interpretation)
 - [ARM64 Validation](#arm64-validation)
+- [Test Suite](#test-suite)
+- [CI Workflows](#ci-workflows)
 - [Limitations](#limitations)
 - [Future Work](#future-work)
+- [Why This Matters for Arm](#why-this-matters-for-arm)
 - [Reproducibility](#reproducibility)
+- [Results Summary](#results-summary)
+- [Conclusion](#conclusion)
 - [License](#license)
 
 ---
 
 ## Overview
 
-Modern neural networks contain many dense fully connected layers.
+Fully connected (`nn.Linear`) layers store dense weight matrices.
 
-A PyTorch `nn.Linear` layer stores its weights as a dense matrix:
+For a layer with `input features = N`, `output features = M`, the weight matrix contains:
 
 $$W \in \mathbb{R}^{M \times N}$$
 
-where `N` = number of input features, `M` = number of output features.
+The number of weight parameters is `M × N`, and with a bias, `M × N + M`.
 
-The number of weight parameters is therefore `M × N`.
+For large neural networks, dense linear layers can therefore account for a substantial portion of the model's parameter count and memory footprint.
 
-For large neural networks, these dense matrices can account for a significant portion of the model's parameters and inference computation.
+TensorFold-arm replaces suitable dense linear layers with low-rank factorized layers. Instead of storing the complete matrix `W`, TensorFold approximates it using two smaller matrices:
 
-TensorFold-arm exploits approximate low-rank structure in these matrices. Instead of storing the complete matrix `W`, TensorFold approximates it using two smaller matrices:
-
-$$W \approx A \times B$$
+$$W \approx AB$$
 
 where $A \in \mathbb{R}^{M \times r}$, $B \in \mathbb{R}^{r \times N}$, and $r \ll \min(M, N)$.
 
-This changes the number of stored weight parameters from `M × N` to:
+The original layer $Y = XW^\top + b$ can then be evaluated as $Y = X(B^\top A^\top) + b$, or equivalently through two matrix multiplications.
 
-$$M \times r + r \times N = r(M + N)$$
-
-When `r` is sufficiently small, this produces a significant reduction in the number of parameters and can also reduce inference computation.
-
----
-
-## The Problem
-
-A dense Linear layer performs:
-
-$$y = Wx + b$$
-
-For a batch of inputs:
-
-$$Y = XW^\top + b$$
-
-If the weight matrix is large, the model has to store and multiply using the complete dense matrix.
-
-For example, consider input features = 784, output features = 512. The dense weight matrix contains:
-
-$$784 \times 512 = 401{,}408$$
-
-weight parameters.
-
-TensorFold asks a simple question: **can the same transformation be represented accurately enough using a much smaller low-rank representation?**
+The main goal is to reduce the number of stored parameters while retaining as much of the original model behavior as possible.
 
 ---
 
 ## Core Idea
 
-TensorFold-arm uses Singular Value Decomposition (SVD) to find a low-rank approximation of a Linear layer's weight matrix.
+The core idea of TensorFold-arm is:
 
-For a matrix `W`:
+```
+Dense Linear Layer
+        │
+        ▼
+   Weight Matrix W
+        │
+        ▼
+   Singular Value
+   Decomposition
+        │
+        ▼
+   U Σ Vᵀ
+        │
+        ▼
+   Keep only the
+   most important r
+   singular components
+        │
+        ▼
+   Fold Σ into U
+        │
+        ▼
+      A B
+        │
+        ▼
+ TensorFoldLinear
+```
 
-$$W = U \Sigma V^\top$$
+Instead of storing the original dense matrix, TensorFold stores the two low-rank factors. The rank `r` determines the compression level.
 
-Instead of keeping every singular component, TensorFold keeps only the first `r` components:
+A **smaller rank** produces: fewer parameters, lower memory usage, potentially lower computational cost, greater approximation error.
 
-$$W \approx U_r \Sigma_r V_r^\top$$
+A **larger rank** produces: more parameters, less compression, lower approximation error, behavior closer to the original dense layer.
 
-The singular values are ordered from largest to smallest:
+Therefore, selecting the rank is the central trade-off in TensorFold.
 
-$$\sigma_1 \geq \sigma_2 \geq \sigma_3 \geq \dots \geq \sigma_k$$
+---
 
-Large singular values represent the dominant directions of the matrix. If most of the matrix's energy is concentrated in the first few singular values, the remaining components can be discarded.
+## Why Low-Rank Compression
 
-TensorFold therefore replaces `W` with $U_r \Sigma_r V_r^\top$ and folds the singular values into one factor:
+Many trained neural-network weight matrices contain redundancy. Although a matrix may technically have a large number of independent entries, its information can often be approximated using a much smaller number of dominant singular components.
 
-$$A = U_r \Sigma_r, \quad B = V_r^\top$$
+A dense matrix of size `M × N` requires `M × N` weight parameters. A rank-`r` factorization requires `M × r` plus `r × N` parameters. Therefore:
 
-giving $W \approx AB$.
+$$P_{dense} = MN, \qquad P_{low\_rank} = Mr + rN$$
+
+Ignoring bias for the moment: $P_{low\_rank} = r(M + N)$.
+
+When $r \ll \min(M, N)$, the reduction can be substantial.
 
 ---
 
 ## Mathematical Foundation
 
-### 1. Dense Matrix
+### Dense Linear Layer
 
-For a Linear layer $W \in \mathbb{R}^{M \times N}$, the number of weight parameters is:
-
-$$P_{dense} = M \times N$$
-
-### 2. SVD
-
-The Singular Value Decomposition of `W` is:
-
-$$W = U \Sigma V^\top$$
-
-where `U` = left singular vectors, `Σ` = singular values, `V` = right singular vectors.
-
-The singular values are sorted in descending order $\sigma_1 \geq \sigma_2 \geq \dots \geq \sigma_k$, where $k = \min(M, N)$.
-
-### 3. Truncated SVD
-
-TensorFold retains only the first `r` singular components:
-
-$$W \approx U_r \Sigma_r V_r^\top$$
-
-where `r < min(M, N)`. The approximation has rank at most `r`. The discarded singular values represent the information removed from the matrix.
-
-The squared Frobenius reconstruction error is:
-
-$$\|W - W_r\|_F^2 = \sigma_{r+1}^2 + \sigma_{r+2}^2 + \dots + \sigma_k^2$$
-
-The truncated SVD provides the best rank-`r` approximation of the matrix under the Frobenius norm.
-
----
-
-## Parameter Compression
-
-The main reason TensorFold can compress a Linear layer is the difference between the parameter counts.
-
-A dense matrix contains `P_dense = M × N` parameters. The factorized representation, with $A \in \mathbb{R}^{M \times r}$ and $B \in \mathbb{R}^{r \times N}$, contains:
-
-$$P_{tensorfold} = M \times r + r \times N = r(M + N)$$
-
-Therefore compression is beneficial when:
-
-$$r(M + N) < MN \quad \text{or} \quad r < \frac{MN}{M + N}$$
-
-This is the fundamental parameter-compression condition used by TensorFold-arm.
-
-### Worked Example
-
-Consider a Linear layer: `784 → 512`
-
-The dense weight matrix is $W \in \mathbb{R}^{512 \times 784}$.
-
-Dense parameters: $512 \times 784 = 401{,}408$
-
-Now suppose SVD rank selection chooses `r = 246`. The two TensorFold factors contain $A \in \mathbb{R}^{512 \times 246}$ and $B \in \mathbb{R}^{246 \times 784}$.
-
-Their parameters are:
-
-- $512 \times 246 = 125{,}952$
-- $246 \times 784 = 192{,}864$
-
-Total: $125{,}952 + 192{,}864 = 318{,}816$
-
-| | Parameters |
-| --- | --- |
-| Dense | 401,408 |
-| TensorFold | 318,816 |
-| Reduction | 82,592 (≈ 20.58%) |
-
-This illustrates how replacing one large matrix with two smaller matrices can reduce parameter storage.
-
----
-
-## SVD-Based Decomposition
-
-TensorFold-arm implements SVD decomposition in `tensorfold/decomposition.py`.
-
-The main function is `low_rank_svd(weight, rank)`. It:
-
-1. Checks that the input is a 2D matrix.
-2. Validates the requested rank.
-3. Computes reduced SVD.
-4. Keeps only the first `rank` components.
-5. Returns $U_r$, $\Sigma_r$, $V_r^\top$.
-
-The implementation uses:
-
-```python
-torch.linalg.svd(
-    weight,
-    full_matrices=False
-)
-```
-
-### Folding the Singular Values
-
-TensorFold does not need to store three separate matrices. Starting from $W \approx U_r \Sigma_r V_r^\top$, we define:
-
-$$A = U_r \Sigma_r, \quad B = V_r^\top$$
-
-Therefore $W \approx AB$.
-
-Because $\Sigma_r$ is diagonal, multiplying $U_r$ by $\Sigma_r$ simply scales the columns of $U_r$. This is performed by `TensorFoldLinear.from_linear()`.
-
----
-
-## Energy-Based Rank Selection
-
-Choosing a rank manually for every layer would be inconvenient. TensorFold-arm therefore provides automatic rank selection using singular-value energy.
-
-The total matrix energy is:
-
-$$E_{total} = \sigma_1^2 + \sigma_2^2 + \dots + \sigma_k^2$$
-
-The energy retained by rank `r` is:
-
-$$E_r = \sigma_1^2 + \sigma_2^2 + \dots + \sigma_r^2$$
-
-The explained energy is $E_r / E_{total}$.
-
-TensorFold chooses the smallest rank satisfying:
-
-$$\frac{E_r}{E_{total}} \geq \text{target\_energy}$$
-
-For example, with `energy = 0.90`, TensorFold selects the smallest rank that preserves at least 90% of the matrix's SVD energy.
-
-This is implemented by `select_rank(weight, energy)`.
-
-### Energy Is Not Accuracy
-
-An important distinction: **90% SVD energy does not mean 90% model accuracy.**
-
-SVD energy measures how much of the original matrix's squared singular value energy is retained. Model accuracy measures how well the complete neural network performs on its task.
-
-Therefore, TensorFold evaluates matrix compression and model accuracy separately.
-
----
-
-## Inference Computation
-
-A normal Linear layer performs:
+A standard PyTorch linear layer computes:
 
 $$Y = XW^\top + b$$
 
-After TensorFold decomposition, $W^\top \approx AB$, therefore:
+where `X` = input tensor, `W` = dense weight matrix, `b` = bias, `Y` = output tensor.
 
-$$Y \approx XAB + b$$
+For `in_features = N`, `out_features = M`, the weight matrix has shape $W \in \mathbb{R}^{M \times N}$ and therefore contains `M × N` weight parameters.
 
-Matrix multiplication is associative: $XAB = (XA)B$. So TensorFold computes:
+Including bias: $P_{dense} = MN + M$
 
-$$Y = (XA)B + b$$
+### SVD Decomposition
 
-instead of multiplying directly by the complete dense matrix.
+TensorFold uses Singular Value Decomposition (SVD). For a matrix `W`, SVD decomposes it as:
 
-### Computational Complexity
+$$W = U \Sigma V^\top$$
 
-For a batch size `B`:
+where `U` = left singular vectors, `Σ` = diagonal matrix of singular values, `Vᵀ` = right singular vectors.
 
-**Dense** — the approximate matrix multiplication cost is $O(BMN)$.
+The singular values are ordered $\sigma_1 \geq \sigma_2 \geq \sigma_3 \geq \dots \geq \sigma_k$, where $k = \min(M, N)$.
 
-**TensorFold** — the factorized computation performs `X × A` followed by `(XA) × B`, giving an approximate cost of:
+The larger singular values generally represent the most significant components of the matrix.
 
-$$O(BMr + BrN) = O(Br(M + N))$$
+### Rank Truncation
 
-Therefore the theoretical compute ratio is approximately:
+Instead of keeping the complete decomposition, TensorFold keeps only the first `r` singular components:
 
-$$\frac{r(M + N)}{MN}$$
+$$W \approx U_r \Sigma_r V_r^\top$$
 
-When `r` is sufficiently smaller than both `M` and `N`, the factorized representation can reduce computation.
+where `r < min(M, N)`. The resulting approximation is the best rank-`r` approximation of the matrix under the standard SVD/Frobenius-norm formulation.
 
-However, theoretical operation counts do not automatically guarantee a real-world speedup. Actual inference performance depends on:
+TensorFold then folds the singular values into one factor. For example, $A = U_r \Sigma_r$ and $B = V_r^\top$, giving $W \approx AB$.
 
-- CPU architecture
-- Matrix dimensions
-- Cache behavior
-- Memory movement
-- PyTorch kernels
-- Threading
-- Batch size
+The original matrix therefore does not need to be stored during inference.
 
-Therefore TensorFold-arm benchmarks the actual implementation on ARM64 hardware.
+### TensorFold Factorization
 
----
+Suppose $W \in \mathbb{R}^{M \times N}$. After truncated SVD, $W \approx U_r \Sigma_r V_r^\top$.
 
-## Architecture
+TensorFold constructs $A = U_r \Sigma_r$ and $B = V_r^\top$, so $A \in \mathbb{R}^{M \times r}$ and $B \in \mathbb{R}^{r \times N}$. Therefore $W \approx AB$.
 
-TensorFold-arm operates as a compression layer around an existing PyTorch model.
+The dense matrix `M × N` has been replaced by `M × r` and `r × N`.
 
-```
-                PyTorch Model
-                     │
-                     ▼
-              ┌─────────────┐
-              │ nn.Linear   │
-              └─────────────┘
-                     │
-                     ▼
-               SVD Analysis
-                     │
-                     ▼
-              Rank Selection
-                     │
-                     ▼
-          Is Compression Beneficial?
-               /             \
-             No               Yes
-             │                 │
-             ▼                 ▼
-      Keep nn.Linear     TensorFoldLinear
-                               │
-                               ▼
-                         Low-Rank Factors
-                            A and B
-```
+### Parameter Reduction
 
-During inference:
+The dense representation requires $P_{dense} = MN + M$ parameters when bias is included.
 
-**Dense Linear:**
+The TensorFold representation requires $P_{tensorfold} = Mr + rN + M$ parameters.
 
-```
-Input
-  │
-  ▼
-┌───────────────┐
-│      W        │
-│     M × N     │
-└───────────────┘
-  │
-  ▼
-Output
-```
+Therefore the parameter reduction is:
 
-**TensorFold:**
+$$\text{Reduction} = \left(1 - \frac{P_{tensorfold}}{P_{dense}}\right) \times 100$$
 
-```
-Input
-  │
-  ▼
-┌───────────────┐
-│      A        │
-│     M × r     │
-└───────────────┘
-  │
-  ▼
-┌───────────────┐
-│      B        │
-│     r × N     │
-└───────────────┘
-  │
-  ▼
-Output
-```
+A positive reduction means that the factorized representation uses fewer parameters than the original dense representation.
 
-The external input and output dimensions remain unchanged. Only the internal representation of the weight transformation changes.
+TensorFold checks whether compression is actually beneficial before replacing a layer. This is important because not every layer benefits from low-rank factorization.
+
+### Example
+
+Consider `input features = 784`, `output features = 512`. The weight matrix is $W \in \mathbb{R}^{512 \times 784}$, containing $512 \times 784 = 401{,}408$ weight parameters.
+
+Including the 512-element bias vector, the complete Linear layer contains $512 \times 784 + 512 = 401{,}920$ parameters.
+
+Now suppose TensorFold selects `rank = 100`. The factorized representation requires `512 × 100` parameters for one factor and `100 × 784` for the second factor. Therefore:
+
+$$P_{tensorfold} = 512 \times 100 + 100 \times 784 + 512 = 51{,}200 + 78{,}400 + 512 = 130{,}112$$
+
+Compared with 401,920, the factorized representation is substantially smaller.
+
+The important point is that TensorFold does not simply delete random weights. It uses the dominant singular components of the trained matrix to construct a lower-rank approximation.
+
+### Energy-Based Rank Selection
+
+TensorFold does not require the user to manually select a rank. Instead, the compression API can select the rank based on the amount of singular-value energy that should be retained.
+
+The singular-value energy is based on the squared singular values $\sigma_1^2, \sigma_2^2, \dots, \sigma_k^2$.
+
+The total energy is $E_{total} = \sum \sigma_i^2$. For a candidate rank `r`, retained energy is $E_r = \sum_{i=1}^{r} \sigma_i^2$.
+
+The retained energy ratio is $\text{Energy}(r) = E_r / E_{total}$.
+
+TensorFold selects the smallest rank satisfying the requested energy target. For example, `energy = 0.90` means TensorFold attempts to retain approximately 90% of the singular-value energy.
+
+This provides an automatic trade-off between compression and approximation quality.
 
 ---
 
 ## How TensorFold Works
 
-The complete compression pipeline is:
+The high-level compression pipeline is:
 
 ```
-Original PyTorch Model
-          │
-          ▼
-    Find nn.Linear
-          │
-          ▼
-     Extract weight
-          │
-          ▼
-       Compute SVD
-          │
-          ▼
-      Select rank r
-          │
-          ▼
- Calculate compressed parameters
-          │
-          ▼
- Is compressed model smaller?
-       /          \
-     No            Yes
-     │              │
-     ▼              ▼
-Keep Linear   TensorFoldLinear
-                     │
-                     ▼
-               Copy bias
-                     │
-                     ▼
-             Return compressed
-                  model
+PyTorch Model
+      │
+      ▼
+Traverse Model
+      │
+      ▼
+Find nn.Linear Layers
+      │
+      ▼
+Analyze Weight Matrix
+      │
+      ▼
+Compute SVD
+      │
+      ▼
+Select Rank
+      │
+      ▼
+Estimate Parameter Count
+      │
+      ├───────────────┐
+      │               │
+ Compression       No Benefit
+ Possible           │
+      │               │
+      ▼               ▼
+Create             Keep Dense
+TensorFoldLinear   Linear Layer
+      │               │
+      └───────┬───────┘
+              ▼
+       Compressed Model
 ```
 
-The original model is not modified. `compress()` creates a deep copy before replacing layers.
+The original model is not modified in-place. The compression function creates a separate compressed model.
 
 ---
 
-## Code Architecture
+## Architecture
 
-The project is divided into a small number of focused components.
+TensorFold-arm is organized into several logical components.
 
-### `tensorfold/decomposition.py`
-
-Contains the mathematical decomposition logic.
-
-Main functions:
-
-- `low_rank_svd()` — Computes a truncated SVD.
-- `select_rank()` — Chooses the smallest rank satisfying the requested energy threshold.
-- `analyze_linear()` — Calculates input features, output features, selected rank, energy, original parameters, compressed parameters, parameter reduction, and compression decision.
-
-### `tensorfold/layers.py`
-
-Contains `TensorFoldLinear`.
-
-The layer stores:
-
-- `U` / `A`: `in_features × rank`
-- `V` / `B`: `rank × out_features`
-
-The forward pass is:
-
-```python
-y = x @ self.U
-y = y @ self.V
+```
+                         TensorFold-arm
+                                │
+              ┌─────────────────┼─────────────────┐
+              │                 │                 │
+              ▼                 ▼                 ▼
+        Decomposition         Layers          Compression
+              │                 │                 │
+              ▼                 ▼                 ▼
+          SVD / Rank       TensorFoldLinear    Model traversal
+          Selection                           and replacement
+              │                 │                 │
+              └─────────────────┼─────────────────┘
+                                │
+                                ▼
+                         Compressed PyTorch
+                              Model
 ```
 
-followed by bias addition.
+**Decomposition** is responsible for SVD, truncated decomposition, rank selection, energy calculation, and layer analysis.
 
-The class method `TensorFoldLinear.from_linear()` converts an existing PyTorch `nn.Linear` layer using truncated SVD.
+**Layers** provides `TensorFoldLinear`, which represents a dense linear transformation using low-rank factors.
 
-### `tensorfold/optimizer.py`
-
-Contains `compress()`.
-
-The optimizer:
-
-1. Deep-copies the model.
-2. Recursively traverses its modules.
-3. Finds `nn.Linear` layers.
-4. Performs SVD-based analysis.
-5. Selects an energy-based rank.
-6. Calculates compressed parameter count.
-7. Replaces the layer only when compression actually reduces parameters.
-
-This prevents TensorFold from replacing layers where the low-rank representation would not provide a parameter benefit.
-
-### `tensorfold/__init__.py`
-
-Exports the public TensorFold API:
-
-- `TensorFoldLinear`
-- `low_rank_svd`
-- `select_rank`
-- `analyze_linear`
-- `compress`
-
-This allows users to write `from tensorfold import compress` instead of importing individual internal modules.
+**Compression** is responsible for traversing models, locating `nn.Linear` layers, analyzing whether compression is beneficial, replacing suitable layers, and preserving layers where compression would not provide a benefit.
 
 ---
 
@@ -489,12 +301,13 @@ TensorFold-arm/
 │
 ├── .github/
 │   └── workflows/
-│       ├── ci.yml
-│       └── arm-test.yml
+│       ├── arm64.yml
+│       └── windows.yml
 │
 ├── benchmarks/
-│
-├── data/
+│   └── results/
+│       ├── arm64_results.md
+│       └── x86_baseline.md
 │
 ├── examples/
 │   ├── basic_compression.py
@@ -502,9 +315,9 @@ TensorFold-arm/
 │
 ├── tensorfold/
 │   ├── __init__.py
+│   ├── compression.py
 │   ├── decomposition.py
-│   ├── layers.py
-│   └── optimizer.py
+│   └── layers.py
 │
 ├── tests/
 │   ├── test_compression.py
@@ -512,14 +325,14 @@ TensorFold-arm/
 │   ├── test_layers.py
 │   └── test_linear.py
 │
-├── .gitignore
-├── LICENSE
-├── README.md
+├── mnist_mlp.pt
 ├── pyproject.toml
-└── requirements.txt
+├── requirements.txt
+├── LICENSE
+└── README.md
 ```
 
-The trained model used for the benchmark is kept out of the repository when configured through `.gitignore`.
+The trained benchmark model is used by the benchmark workflow and is required for reproducing the benchmark.
 
 ---
 
@@ -538,193 +351,267 @@ Create a virtual environment:
 python -m venv venv
 ```
 
-Activate it.
+Activate it on Windows:
 
-**Linux / macOS**
+```bash
+venv\Scripts\activate
+```
+
+On Linux:
 
 ```bash
 source venv/bin/activate
 ```
 
-**Windows PowerShell**
-
-```powershell
-venv\Scripts\Activate.ps1
-```
-
 Install dependencies:
 
 ```bash
+python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-Install TensorFold-arm in editable mode:
+Install TensorFold-arm:
 
 ```bash
 pip install -e .
+```
+
+Verify the installation:
+
+```bash
+python -c "import tensorfold; print('TensorFold imported successfully')"
 ```
 
 ---
 
 ## Usage
 
-### Create a TensorFold Linear Layer
+TensorFold can compress a PyTorch model using the public compression API.
+
+Example:
 
 ```python
-from tensorfold import TensorFoldLinear
+import torch
+import torch.nn as nn
 
-layer = TensorFoldLinear(
-    in_features=784,
-    out_features=512,
-    rank=128
+from tensorfold import compress
+
+
+model = nn.Sequential(
+    nn.Linear(784, 512),
+    nn.ReLU(),
+    nn.Linear(512, 256),
+    nn.ReLU(),
+    nn.Linear(256, 10),
+)
+
+compressed_model = compress(
+    model,
+    energy=0.90,
 )
 ```
 
-The layer stores two low-rank matrices rather than one dense matrix.
+The `energy` parameter controls the amount of singular-value energy retained. For example, `energy=0.90` requests approximately 90% energy preservation for the selected layers.
 
-### Convert an Existing Linear Layer
+---
+
+## Compression API
+
+The main API is:
+
+```python
+compress(
+    model,
+    energy=0.90,
+)
+```
+
+The compression pipeline:
+
+1. Traverses the model.
+2. Finds `nn.Linear` layers.
+3. Computes the SVD of their weights.
+4. Selects a rank based on the requested energy.
+5. Calculates the dense and factorized parameter counts.
+6. Determines whether compression is beneficial.
+7. Replaces beneficial layers with `TensorFoldLinear`.
+8. Leaves non-beneficial layers unchanged.
+9. Returns a new model.
+
+Example:
+
+```python
+compressed = compress(
+    model,
+    energy=0.90,
+)
+```
+
+The original model remains unchanged.
+
+---
+
+## TensorFoldLinear
+
+`TensorFoldLinear` is the low-rank replacement for `nn.Linear`.
+
+Example:
+
+```python
+from tensorfold.layers import TensorFoldLinear
+
+layer = TensorFoldLinear(
+    in_features=64,
+    out_features=32,
+    rank=16,
+)
+```
+
+The factorized layer stores $U \in \mathbb{R}^{\text{out\_features} \times \text{rank}}$ and $V \in \mathbb{R}^{\text{rank} \times \text{in\_features}}$, plus an optional bias.
+
+Therefore its parameter count is `out_features × rank + rank × in_features + out_features` when bias is enabled.
+
+### Creating From a Dense Layer
+
+A dense layer can be converted directly:
 
 ```python
 import torch.nn as nn
-from tensorfold import TensorFoldLinear
 
-dense = nn.Linear(784, 512)
+from tensorfold.layers import TensorFoldLinear
+
+
+dense = nn.Linear(
+    128,
+    64,
+)
 
 compressed = TensorFoldLinear.from_linear(
     dense,
-    rank=128
+    rank=16,
 )
 ```
 
-The bias is copied from the original layer.
+The bias configuration is preserved.
 
-### Analyze a Linear Layer
+---
+
+## Compression Analysis
+
+TensorFold provides analysis functionality for determining whether a layer should be compressed.
+
+Example:
 
 ```python
-from tensorfold import analyze_linear
+from tensorfold.decomposition import analyze_linear
 
-analysis = analyze_linear(
-    dense.weight,
-    energy=0.90
+result = analyze_linear(
+    weight,
+    energy=0.90,
 )
-
-print(analysis)
 ```
 
-The analysis returns information including:
+The analysis includes information such as:
 
+- `in_features`
+- `out_features`
 - `rank`
-- `energy`
 - `original_parameters`
 - `compressed_parameters`
 - `parameter_reduction`
 - `compression_possible`
 
+This allows the compression pipeline to avoid replacing layers where the factorized representation would actually require more parameters.
+
 ---
 
-## Automatic Model Compression
+## Benchmark Model
 
-The main high-level API is:
+The benchmark uses a multilayer perceptron trained on MNIST.
 
-```python
-from tensorfold import compress
-
-compressed_model = compress(
-    model,
-    energy=0.90
-)
+```
+Input
+  │
+  ▼
+Linear: 784 → 512
+  │
+ReLU
+  │
+  ▼
+Linear: 512 → 256
+  │
+ReLU
+  │
+  ▼
+Linear: 256 → 10
+  │
+  ▼
+Output
 ```
 
-TensorFold recursively searches the model for `nn.Linear` layers. Only layers where `compressed_parameters < original_parameters` are replaced. The original model remains unchanged.
+Compact representation: `784 → 512 → 256 → 10`
+
+The model contains three dense Linear layers. TensorFold analyzes each Linear layer independently and replaces layers where the selected low-rank representation provides a parameter reduction.
 
 ---
 
-## Running Tests
-
-Run the complete test suite:
-
-```bash
-pytest tests -v
-```
-
-The current test suite contains 13 tests covering:
-
-- SVD decomposition
-- Low-rank reconstruction
-- Invalid ranks
-- Energy-based rank selection
-- Invalid energy values
-- Linear-layer analysis
-- TensorFoldLinear forward/backward behavior
-- Parameter counts
-- Shape validation
-- Conversion from `nn.Linear`
-- Bias and no-bias behavior
-- Automatic compression
-
-The test suite currently passes: `13 passed`
-
----
-
-## Benchmark Methodology
-
-TensorFold-arm benchmarks dense and TensorFold versions of the same MNIST MLP.
-
-The model architecture is `784 → 512 → 256 → 10`.
-
-The benchmark compares a Dense PyTorch model against a TensorFold model using a 90% SVD energy target.
-
-Benchmark configuration:
+## Benchmark Configuration
 
 | Setting | Value |
 | --- | --- |
+| Energy target | 90% |
 | Threads | 1 |
+| Warmup iterations | 100 |
 | Repeats | 10 |
-| Iterations | 500 |
+| Iterations per repeat | 500 |
+| Batch sizes | 1, 16, 32, 64, 256 |
 
-The benchmark reports mean latency, median latency, standard deviation, speedup, parameter count, and parameter reduction.
+Latency is measured using Python's `time.perf_counter()`.
 
-The benchmark is intentionally run with a single thread so that the comparison is controlled and reproducible.
+The benchmark reports mean latency, median latency, standard deviation, and speedup.
+
+Speedup is calculated as:
+
+$$\text{Speedup} = \frac{\text{Dense Mean Latency}}{\text{TensorFold Mean Latency}}$$
+
+`Speedup > 1` means TensorFold is faster; `Speedup < 1` means the dense model is faster.
 
 ---
 
-## ARM64 Benchmark Results
+## Benchmark Results
 
-The primary performance evaluation was performed on a native ARM64 GitHub Actions runner.
+The benchmark demonstrates two separate effects: parameter compression and inference performance.
 
-The ARM64 workflow uses `runs-on: ubuntu-24.04-arm`. The workflow verifies the architecture before running the benchmark.
-
-The resulting ARM64 measurements are:
-
-| Batch Size | Dense Mean (ms) | TensorFold 90% Mean (ms) | Speedup |
-| --- | --- | --- | --- |
-| 1 | 0.1914 | 0.1759 | 1.088× |
-| 16 | 0.7866 | 0.5991 | 1.313× |
-| 32 | 1.2195 | 0.8667 | 1.407× |
-| 64 | 2.1408 | 1.4104 | 1.518× |
-| 256 | 7.5964 | 4.5649 | 1.664× |
-
-The highest measured speedup is **1.664×** at batch size 256. This corresponds to approximately **39.9%** lower measured mean latency for that benchmark configuration.
-
-### Parameter Compression Results
-
-For the benchmark model:
+The parameter reduction is consistent across the benchmarked platforms:
 
 | Metric | Value |
 | --- | --- |
 | Dense parameters | 535,818 |
-| TensorFold parameters (90% energy) | 279,940 |
+| TensorFold parameters | 279,940 |
 | Parameter reduction | 47.75% |
-
-Therefore the compressed model stores less than 53% of the original parameter count for this benchmark configuration.
 
 ---
 
-## x86 Reference Benchmark
+## AMD64 Reference Benchmark
 
-For comparison, the same benchmark was also run on the development environment.
+The AMD64 reference benchmark was performed using:
 
-| Batch Size | Dense Mean (ms) | TensorFold 90% Mean (ms) | Speedup |
+| Property | Value |
+| --- | --- |
+| Platform | Windows |
+| Architecture | AMD64 |
+| Python | 3.11.9 |
+| PyTorch | 2.13.0+cpu |
+| Execution device | CPU |
+| Threads | 1 |
+| Warmup | 100 |
+| Repeats | 10 |
+| Iterations | 500 |
+| Energy target | 90% |
+
+### AMD64 Results
+
+| Batch Size | Dense Mean (ms) | TensorFold Mean (ms) | Speedup |
 | --- | --- | --- | --- |
 | 1 | 0.0852 | 0.0820 | 1.039× |
 | 16 | 0.3182 | 0.2401 | 1.325× |
@@ -732,29 +619,274 @@ For comparison, the same benchmark was also run on the development environment.
 | 64 | 0.8549 | 0.5702 | 1.499× |
 | 256 | 3.0489 | 1.9401 | 1.572× |
 
-The x86 measurements are provided as a reference. The primary target of TensorFold-arm is Arm64 CPU inference.
+TensorFold was faster than the dense model at every tested AMD64 batch size in this reference run.
+
+The complete AMD64 benchmark is available at `benchmarks/results/x86_baseline.md`.
 
 ---
 
-## Accuracy Results
+## Native ARM64 Benchmark
 
-The benchmark model was evaluated before and after TensorFold compression.
+TensorFold-arm was also benchmarked on a native ARM64 Linux environment.
 
-| Model | Accuracy |
+| Property | Value |
 | --- | --- |
-| Dense | 97.79% |
-| TensorFold | 97.06% |
-| Difference | -0.73 pp |
+| Platform | Linux |
+| Architecture | ARM64 (aarch64) |
+| Python | 3.11.15 |
+| PyTorch | 2.13.0+cu130 |
+| Execution device | CPU |
+| Threads | 1 |
+| Warmup | 100 |
+| Repeats | 10 |
+| Iterations | 500 |
+| Energy target | 90% |
 
-The compression therefore produced a substantial reduction in parameter count while maintaining similar model accuracy for the tested MNIST model.
+The PyTorch build contains CUDA support, but the benchmark explicitly runs on `torch.device("cpu")`. Therefore these measurements are CPU measurements.
 
-Accuracy and SVD energy should not be interpreted as the same metric.
+### ARM64 Results
+
+| Batch Size | Dense Mean (ms) | TensorFold Mean (ms) | Speedup |
+| --- | --- | --- | --- |
+| 1 | 0.1244 | 0.1111 | 1.119× |
+| 16 | 0.6872 | 0.4862 | 1.413× |
+| 32 | 0.7642 | 0.6319 | 1.209× |
+| 64 | 0.9771 | 1.0739 | 0.910× |
+| 256 | 2.0406 | 3.4052 | 0.599× |
+
+The highest measured ARM64 speedup is **1.413×** at batch size 16.
+
+TensorFold was faster at batch sizes 1, 16, and 32, and slower at 64 and 256.
+
+The complete ARM64 benchmark results are available at `benchmarks/results/arm64_results.md`.
+
+---
+
+## Benchmark Interpretation
+
+Parameter reduction and inference speed are related but are not equivalent.
+
+A dense Linear layer performs a matrix multiplication:
+
+$$Y = XW + b$$
+
+TensorFold replaces the dense matrix with a low-rank approximation $W \approx AB$ and therefore performs:
+
+$$Y = (XA)B + b$$
+
+The factorized representation contains substantially fewer parameters. However, the factorized computation introduces two matrix multiplications instead of the original dense matrix multiplication.
+
+Therefore, actual inference performance depends on:
+
+- Matrix dimensions
+- Selected rank
+- Batch size
+- CPU architecture
+- Memory access patterns
+- Matrix multiplication implementation
+- Framework overhead
+- Kernel efficiency
+
+The benchmark demonstrates this directly. On AMD64, TensorFold produced a speedup for all tested batch sizes. On the latest ARM64 run, TensorFold produced speedups for batch sizes 1, 16, and 32, but was slower for batch sizes 64 and 256.
+
+This is an important engineering result: **low-rank compression can substantially reduce model parameters, but it does not guarantee faster inference for every workload.**
+
+The primary optimization target of TensorFold-arm is therefore model compression and parameter reduction, while inference acceleration is workload-dependent.
+
+---
+
+## ARM64 Validation
+
+A key goal of TensorFold-arm is to ensure that the implementation and benchmarks actually work on Arm64 hardware.
+
+The ARM64 GitHub Actions workflow runs on `ubuntu-24.04-arm`.
+
+Before running the tests, the workflow verifies the architecture. It checks `uname -m` and `platform.machine()`. The expected result is `aarch64`. The workflow also explicitly asserts that the machine is ARM64.
+
+The ARM64 CI pipeline performs the following steps:
+
+```
+Checkout repository
+        │
+        ▼
+Set up Python 3.11
+        │
+        ▼
+Verify ARM64 architecture
+        │
+        ▼
+Install dependencies
+        │
+        ▼
+Install TensorFold-arm
+        │
+        ▼
+Verify TensorFold installation
+        │
+        ▼
+Verify benchmark model
+        │
+        ▼
+Run complete test suite
+        │
+        ▼
+Run ARM64 benchmark
+```
+
+This means the ARM64 benchmark is not inferred from AMD64 results and is not simply a local AMD64 benchmark labeled as ARM64. The benchmark is executed in the ARM64 CI environment itself.
+
+---
+
+## Test Suite
+
+TensorFold-arm contains automated tests covering the core functionality of the project.
+
+The current test suite contains **34 tests**, covering:
+
+- SVD decomposition
+- Low-rank SVD shapes
+- SVD reconstruction
+- Invalid rank handling
+- Energy-based rank selection
+- Invalid energy handling
+- Linear-layer analysis
+- TensorFoldLinear forward behavior
+- TensorFoldLinear backward behavior
+- Gradient propagation
+- Shape validation
+- Parameter counting
+- Parameter reduction
+- Invalid TensorFoldLinear ranks
+- Conversion from `nn.Linear`
+- Bias preservation
+- No-bias layers
+- Automatic model compression
+- Beneficial Linear-layer replacement
+- Preservation of the original model
+- Compression behavior
+
+The complete test suite passes: `34 passed`
+
+The tests are executed in both the Windows AMD64 and ARM64 CI workflows.
+
+---
+
+## CI Workflows
+
+TensorFold-arm uses GitHub Actions for continuous validation.
+
+The project contains workflows for Windows / AMD64 and ARM64. The ARM64 workflow verifies the architecture before testing.
+
+The CI pipeline validates:
+
+```
+Python environment
+        ↓
+Dependencies
+        ↓
+Package installation
+        ↓
+Importability
+        ↓
+Test suite
+        ↓
+Benchmark
+```
+
+Both the Windows and ARM64 workflows currently complete successfully.
+
+---
+
+## Limitations
+
+TensorFold-arm currently focuses on dense two-dimensional Linear-layer weights.
+
+**1. Linear layers** — The current compression pipeline focuses on `torch.nn.Linear` rather than arbitrary neural-network operators.
+
+**2. Low-rank approximation** — TensorFold introduces approximation error because $W \approx AB$ rather than $W = AB$, unless the selected rank is sufficient to represent the matrix exactly.
+
+**3. Inference speed** — Parameter reduction does not automatically guarantee lower latency. The benchmark demonstrates that TensorFold can be slower than the dense implementation for some ARM64 batch sizes.
+
+**4. Kernel optimization** — The current implementation relies on PyTorch matrix multiplication operations. Further ARM-specific optimization could potentially improve the performance of the factorized operations.
+
+**5. Rank selection** — The energy target is a useful automatic heuristic, but the optimal rank may depend on the particular model, workload, accuracy requirement, and hardware.
+
+---
+
+## Future Work
+
+Potential future improvements include:
+
+**ARM-specific optimization** — Investigate optimized ARM matrix multiplication paths and kernels for the factorized operations.
+
+**Better rank selection** — Explore rank-selection strategies that consider accuracy impact, parameter reduction, latency, and hardware characteristics instead of energy preservation alone.
+
+**Layer-wise optimization** — Allow different compression targets for different layers, e.g.:
+
+```
+Layer 1 → 95%
+Layer 2 → 90%
+Layer 3 → 98%
+```
+
+depending on sensitivity.
+
+**Accuracy-aware compression** — Instead of selecting the rank purely from singular-value energy, evaluate the effect of compression on validation accuracy.
+
+**More model architectures** — Extend benchmarking beyond the MNIST MLP to larger neural networks and different architectures.
+
+**More Arm hardware** — Benchmark on multiple ARM64 processors to determine how the factorized implementation behaves across different Arm CPU microarchitectures.
+
+**Optimized kernels** — Develop specialized kernels for `X × A` and `(X × A) × B` to reduce the overhead associated with the two-stage factorized computation.
+
+**Additional decompositions** — The current implementation is based on matrix SVD. Future versions could explore other low-rank and tensor decomposition approaches for higher-dimensional tensors.
+
+---
+
+## Why This Matters for Arm
+
+Neural-network inference on edge and CPU-based systems is constrained by memory, power, compute capacity, bandwidth, and model size.
+
+Reducing the number of model parameters can reduce the amount of model data that needs to be stored and moved through the memory hierarchy.
+
+For the benchmarked MNIST model, Dense = 535,818 parameters and TensorFold = 279,940 parameters, corresponding to **47.75% parameter reduction**.
+
+The same compressed model representation can therefore provide a smaller parameter footprint while maintaining a substantial portion of the original model's accuracy.
+
+The ARM64 benchmark further demonstrates that low-rank inference can provide speedups for certain workloads. However, the benchmark also shows that further ARM-specific kernel optimization is necessary if the goal is to guarantee latency improvements across a broader range of workloads.
+
+---
+
+## Reproducibility
+
+The benchmark can be executed with:
+
+```bash
+python examples/benchmark_tensorfold.py
+```
+
+The benchmark configuration is defined in `examples/benchmark_tensorfold.py`.
+
+The benchmark model is `mnist_mlp.pt`.
+
+The compression target is 90% singular-value energy.
+
+The tested batch sizes are 1, 16, 32, 64, 256.
+
+The benchmark uses:
+
+| Setting | Value |
+| --- | --- |
+| Threads | 1 |
+| Warmup | 100 |
+| Repeats | 10 |
+| Iterations | 500 |
 
 ---
 
 ## Results Summary
 
-The main results are:
+The primary compression result is:
 
 | Metric | Result |
 | --- | --- |
@@ -763,206 +895,55 @@ The main results are:
 | Parameter reduction | 47.75% |
 | Dense accuracy | 97.79% |
 | TensorFold accuracy | 97.06% |
-| Accuracy difference | -0.73 pp |
-| Maximum ARM64 speedup | 1.664× |
-| Maximum speedup batch size | 256 |
+| Accuracy change | -0.73 percentage points |
 
-The results demonstrate that the low-rank representation can reduce both parameter count and inference latency for the tested model.
+The AMD64 reference benchmark produced speedups from 1.039× → 1.572× across the tested batch sizes.
 
----
+The latest native ARM64 benchmark produced:
 
-## ARM64 Validation
-
-TensorFold-arm is not only benchmarked locally. The project includes a dedicated ARM64 GitHub Actions workflow.
-
-The workflow runs on `ubuntu-24.04-arm` and verifies:
-
-- Machine architecture
-- CPU information
-- Python architecture
-- PyTorch installation
-- TensorFold installation
-
-The workflow then executes the TensorFold benchmark directly on the ARM64 environment. This provides a reproducible ARM64 execution path rather than relying only on x86 development results.
-
-### Continuous Integration
-
-The repository also contains a standard CI workflow. The CI pipeline verifies that:
-
-```
-Python environment
-       ↓
-Dependencies
-       ↓
-TensorFold installation
-       ↓
-Package import
-       ↓
-Pytest
-```
-
-complete successfully.
-
-The ARM64 workflow extends this validation to the target architecture and additionally runs the benchmark.
-
----
-
-## Limitations
-
-The current implementation intentionally focuses on 2D matrices.
-
-**Supported:**
-
-- PyTorch `nn.Linear`
-- 2D weight matrices
-- SVD-based decomposition
-- Low-rank factorization
-- Energy-based rank selection
-- Automatic Linear-layer replacement
-- CPU inference
-- ARM64 benchmarking
-
-The current implementation does not yet provide native tensor decompositions for higher-order tensors. Methods such as Tucker, CP, and Tensor Train are therefore outside the current implementation scope.
-
-The current TensorFold-arm implementation uses SVD because the weights being compressed are 2D matrices.
-
----
-
-## Future Work
-
-Possible future improvements include:
-
-### Latency-Aware Rank Selection
-
-Instead of selecting rank only from SVD energy:
-
-```
-Energy target
-      ↓
-Candidate ranks
-      ↓
-Benchmark candidates
-      ↓
-Select best latency / accuracy tradeoff
-```
-
-This could make rank selection hardware-aware.
-
-### Higher-Order Tensor Decompositions
-
-Future versions could extend beyond 2D matrices and support Tucker, CP, and Tensor Train for higher-order neural-network tensors.
-
-### More ARM Platforms
-
-Future benchmarking could evaluate different ARM64 CPUs, different core counts, different batch sizes, and different PyTorch versions to determine how low-rank inference behaves across the ARM ecosystem.
-
-### Larger Models
-
-Future evaluations can include larger neural networks and transformer models to determine how the approach scales beyond the current MNIST MLP benchmark.
-
----
-
-## Reproducibility
-
-To reproduce the benchmark:
-
-```bash
-python examples/benchmark_tensorfold.py
-```
-
-The benchmark configuration is:
-
-| Setting | Value |
+| Batch Size | Speedup |
 | --- | --- |
-| Threads | 1 |
-| Repeats | 10 |
-| Iterations | 500 |
+| 1 | 1.119× |
+| 16 | 1.413× |
+| 32 | 1.209× |
+| 64 | 0.910× |
+| 256 | 0.599× |
 
-To reproduce the test suite:
+The highest ARM64 speedup was **1.413×** at batch size 16.
 
-```bash
-pytest tests -v
-```
-
-For ARM64 validation, use the GitHub Actions ARM64 workflow included in `.github/workflows/arm-test.yml`.
+The results show that TensorFold's strongest consistent benefit is parameter compression, while inference acceleration depends on the workload and hardware.
 
 ---
 
-## Design Philosophy
+## Conclusion
 
-TensorFold-arm is intentionally implemented as a small, focused optimization layer rather than a complete neural-network framework.
+TensorFold-arm demonstrates a practical approach to compressing dense neural network layers using low-rank matrix decomposition.
 
-The project operates on existing PyTorch models:
+The project:
 
-```
-Existing PyTorch Model
-          │
-          ▼
-       TensorFold
-          │
-          ▼
-Compressed PyTorch Model
-```
+- Automatically analyzes `nn.Linear` layers
+- Uses SVD for low-rank approximation
+- Selects ranks using singular-value energy
+- Replaces beneficial layers with `TensorFoldLinear`
+- Preserves non-beneficial dense layers
+- Reduces the benchmark model's parameters by 47.75%
+- Maintains 97.06% MNIST accuracy compared with 97.79% for the dense model
+- Runs on native ARM64
+- Includes automated ARM64 architecture verification
+- Includes Windows AMD64 and ARM64 CI workflows
+- Contains 34 passing automated tests
+- Provides reproducible CPU benchmarks
 
-This allows the optimization to be applied without requiring users to rewrite their neural-network architecture.
+The benchmark results also highlight an important distinction between compression and acceleration. TensorFold can significantly reduce the parameter footprint of a model, but the factorized implementation does not automatically outperform dense matrix multiplication for every workload.
 
-The core transformation is simple:
+This makes the project both a compression technique and a starting point for further ARM-specific inference optimization.
 
-```
-Dense:
-
-W ∈ R^(M × N)
-
-        ↓ SVD
-
-W ≈ UᵣΣᵣVᵣᵀ
-
-        ↓ fold Σ
-
-W ≈ AB
-
-        ↓
-
-A ∈ R^(M × r)
-B ∈ R^(r × N)
-```
-
-The result is a smaller representation of the original Linear-layer weight matrix.
-
----
-
-## Summary
-
-TensorFold-arm demonstrates an SVD-based approach to neural-network inference optimization on Arm64 CPUs.
-
-The central transformation is $W \approx AB$, which changes the parameter count from `MN` to `r(M + N)` when $r \ll \min(M, N)$.
-
-For the tested MNIST MLP: 535,818 → 279,940 parameters, giving **47.75% parameter reduction**, while model accuracy changed from **97.79%** to **97.06%**, and the native ARM64 benchmark achieved a maximum measured speedup of **1.664×** at batch size 256.
-
-The project demonstrates that low-rank matrix decomposition can be used as a practical model-compression technique for CPU inference while retaining the original PyTorch model interface.
+Future work can focus on optimized ARM kernels, hardware-aware rank selection, accuracy-aware compression, and broader model and hardware evaluation.
 
 ---
 
 ## License
 
-TensorFold-arm is released under the MIT License. See `LICENSE` for the complete license text.
+TensorFold-arm is released under the license included in `LICENSE`.
 
----
-
-## Project Status
-
-TensorFold-arm currently provides:
-
-- SVD-based Linear-layer decomposition
-- Energy-based rank selection
-- Automatic model compression
-- Low-rank `TensorFoldLinear`
-- PyTorch integration
-- Unit tests
-- Continuous integration
-- Native ARM64 testing
-- ARM64 performance benchmarking
-- Parameter reduction analysis
-- Accuracy evaluation
-
-The project was developed as an independent implementation for the Arm AI Optimization Challenge.
+See the `LICENSE` file for the complete terms and conditions.
