@@ -1,5 +1,7 @@
-import time
+import platform
 import statistics
+import time
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -29,13 +31,14 @@ class MLP(nn.Module):
 # Configuration
 # --------------------------------------------------
 
-device = torch.device("cpu")
+DEVICE = torch.device("cpu")
 
-torch.set_num_threads(1)
-
+THREADS = 1
 WARMUP = 100
 ITERATIONS = 500
 REPEATS = 10
+
+ENERGY = 0.90
 
 BATCH_SIZES = [
     1,
@@ -47,78 +50,42 @@ BATCH_SIZES = [
 
 
 # --------------------------------------------------
-# Load model
+# Model path
 # --------------------------------------------------
 
-model = MLP().to(device)
-
-model.load_state_dict(
-    torch.load(
-        "mnist_mlp.pt",
-        map_location=device,
-    )
-)
-
-model.eval()
-
-
-tensorfold_model = compress(
-    model,
-    energy=0.90,
-)
-
-tensorfold_model.eval()
+ROOT = Path(__file__).resolve().parent.parent
+MODEL_PATH = ROOT / "mnist_mlp.pt"
 
 
 # --------------------------------------------------
-# Statistics
+# Utilities
 # --------------------------------------------------
 
 def parameter_count(model):
     return sum(
-        p.numel()
-        for p in model.parameters()
+        parameter.numel()
+        for parameter in model.parameters()
     )
 
 
-dense_parameters = parameter_count(model)
-
-tensorfold_parameters = parameter_count(
-    tensorfold_model
-)
-
-parameter_reduction = (
-    1
-    - tensorfold_parameters
-    / dense_parameters
-) * 100
-
-
-# --------------------------------------------------
-# Benchmark
-# --------------------------------------------------
-
 def benchmark(model, batch_size):
-
     x = torch.randn(
         batch_size,
         784,
-        device=device,
+        device=DEVICE,
     )
 
+    # Warmup
     with torch.no_grad():
-
         for _ in range(WARMUP):
             model(x)
 
     measurements = []
 
     for _ in range(REPEATS):
-
         start = time.perf_counter()
 
         with torch.no_grad():
-
             for _ in range(ITERATIONS):
                 model(x)
 
@@ -140,80 +107,150 @@ def benchmark(model, batch_size):
 
 
 # --------------------------------------------------
-# Results
+# Main
 # --------------------------------------------------
 
-print("TensorFold CPU Benchmark")
-print("========================")
+def main():
 
-print(f"Threads: 1")
-print(f"Repeats: {REPEATS}")
-print(f"Iterations: {ITERATIONS}")
+    torch.set_num_threads(THREADS)
 
-print()
+    # --------------------------------------------------
+    # Load model
+    # --------------------------------------------------
 
-print(
-    f"Dense parameters: "
-    f"{dense_parameters:,}"
-)
+    if not MODEL_PATH.exists():
+        raise FileNotFoundError(
+            f"Model file not found: {MODEL_PATH}"
+        )
 
-print(
-    f"TensorFold parameters: "
-    f"{tensorfold_parameters:,}"
-)
+    model = MLP().to(DEVICE)
 
-print(
-    f"Parameter reduction: "
-    f"{parameter_reduction:.2f}%"
-)
+    model.load_state_dict(
+        torch.load(
+            MODEL_PATH,
+            map_location=DEVICE,
+        )
+    )
 
-print()
+    model.eval()
 
-print(
-    f"{'Batch':>8} "
-    f"{'Model':<16} "
-    f"{'Mean':>12} "
-    f"{'Median':>12} "
-    f"{'Std':>12} "
-    f"{'Speedup':>12}"
-)
+    # --------------------------------------------------
+    # Compress model
+    # --------------------------------------------------
 
-print("-" * 76)
-
-
-for batch_size in BATCH_SIZES:
-
-    dense = benchmark(
+    tensorfold_model = compress(
         model,
-        batch_size,
+        energy=ENERGY,
     )
 
-    tensorfold = benchmark(
-        tensorfold_model,
-        batch_size,
+    tensorfold_model.eval()
+
+    # --------------------------------------------------
+    # Parameter statistics
+    # --------------------------------------------------
+
+    dense_parameters = parameter_count(model)
+
+    tensorfold_parameters = parameter_count(
+        tensorfold_model
     )
 
-    speedup = (
-        dense["mean"]
-        / tensorfold["mean"]
+    parameter_reduction = (
+        1
+        - tensorfold_parameters
+        / dense_parameters
+    ) * 100
+
+    # --------------------------------------------------
+    # System information
+    # --------------------------------------------------
+
+    print("TensorFold CPU Benchmark")
+    print("========================")
+    print()
+
+    print(f"Platform: {platform.system()}")
+    print(f"Architecture: {platform.machine()}")
+    print(f"Python: {platform.python_version()}")
+    print(f"PyTorch: {torch.__version__}")
+    print()
+
+    print(f"Threads: {THREADS}")
+    print(f"Energy target: {ENERGY:.0%}")
+    print(f"Warmup: {WARMUP}")
+    print(f"Repeats: {REPEATS}")
+    print(f"Iterations: {ITERATIONS}")
+    print()
+
+    print(
+        f"Dense parameters: "
+        f"{dense_parameters:,}"
     )
 
     print(
-        f"{batch_size:>8} "
-        f"{'Dense':<16} "
-        f"{dense['mean']:>12.4f} "
-        f"{dense['median']:>12.4f} "
-        f"{dense['std']:>12.4f} "
-        f"{'-':>12}"
+        f"TensorFold parameters: "
+        f"{tensorfold_parameters:,}"
     )
 
     print(
-        f"{'':>8} "
-        f"{'TensorFold 90%':<16} "
-        f"{tensorfold['mean']:>12.4f} "
-        f"{tensorfold['median']:>12.4f} "
-        f"{tensorfold['std']:>12.4f} "
-        f"{speedup:>11.3f}x"
+        f"Parameter reduction: "
+        f"{parameter_reduction:.2f}%"
     )
 
     print()
+
+    # --------------------------------------------------
+    # Benchmark results
+    # --------------------------------------------------
+
+    print(
+        f"{'Batch':>8} "
+        f"{'Model':<18} "
+        f"{'Mean':>12} "
+        f"{'Median':>12} "
+        f"{'Std':>12} "
+        f"{'Speedup':>12}"
+    )
+
+    print("-" * 80)
+
+    for batch_size in BATCH_SIZES:
+
+        dense = benchmark(
+            model,
+            batch_size,
+        )
+
+        tensorfold = benchmark(
+            tensorfold_model,
+            batch_size,
+        )
+
+        speedup = (
+            dense["mean"]
+            / tensorfold["mean"]
+        )
+
+        print(
+            f"{batch_size:>8} "
+            f"{'Dense':<18} "
+            f"{dense['mean']:>12.4f} "
+            f"{dense['median']:>12.4f} "
+            f"{dense['std']:>12.4f} "
+            f"{'-':>12}"
+        )
+
+        print(
+            f"{'':>8} "
+            f"{'TensorFold 90%':<18} "
+            f"{tensorfold['mean']:>12.4f} "
+            f"{tensorfold['median']:>12.4f} "
+            f"{tensorfold['std']:>12.4f} "
+            f"{speedup:>11.3f}x"
+        )
+
+        print()
+
+
+if __name__ == "__main__":
+    main()
