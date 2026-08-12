@@ -368,6 +368,15 @@ Run pytest
         │
         ▼
 Run benchmark
+        │
+        ▼
+Run fused-kernel correctness tests
+        │
+        ▼
+Run fused-kernel benchmark
+        │
+        ▼
+Run three-way benchmark (dense / torch / fused)
 ```
 
 Both the tests and benchmark therefore execute inside the ARM64 environment.
@@ -376,7 +385,7 @@ Both the tests and benchmark therefore execute inside the ARM64 environment.
 
 ## 19. ARM64 Test Validation
 
-The project currently contains **13 tests**. The test suite covers:
+The project currently contains **34 tests** (`tests/test_compression.py`, `tests/test_decomposition.py`, `tests/test_layers.py`, `tests/test_linear.py`), plus a separate 28-test suite (`tests/test_fused_backend.py`) covering the fused-kernel investigation described in section 39 below. The core test suite covers:
 
 - SVD decomposition
 - Low-rank reconstruction
@@ -384,15 +393,15 @@ The project currently contains **13 tests**. The test suite covers:
 - Energy-based rank selection
 - Invalid energy handling
 - Linear-layer analysis
-- TensorFoldLinear backward propagation
+- TensorFoldLinear forward and backward propagation
 - Tensor shape validation
-- TensorFoldLinear parameter counting
+- TensorFoldLinear parameter counting and reduction
 - Invalid TensorFoldLinear rank handling
 - Conversion from `nn.Linear`
 - Bias handling
-- Automatic model compression
+- Automatic model compression and original-model preservation
 
-The test suite passes locally and also passes in the ARM64 GitHub Actions workflow. A successful test run reports: `13 passed`.
+The test suite passes locally and also passes in the ARM64 GitHub Actions workflow. A successful test run reports: `34 passed`. (An earlier version of this document reported 13 tests; that number was accurate for an earlier point in the project's development and is corrected here.)
 
 ---
 
@@ -422,6 +431,8 @@ The test suite passes locally and also passes in the ARM64 GitHub Actions workfl
 | 256 | Dense | 2.0406 | 2.0376 | 0.0100 | – |
 | 256 | TensorFold 90% | 3.4052 | 3.4045 | 0.0048 | 0.599× |
 
+(An earlier version of this document reported a different table in which speedup increased monotonically to 1.664× at batch 256. That table did not match `benchmarks/results/arm64_results.md` and has been replaced with the correct, verified numbers above, which have since been independently reproduced by `benchmarks/bench_three_way.py` — see section 39.)
+
 ---
 
 ## 22. ARM64 Speedup Analysis
@@ -436,11 +447,11 @@ TensorFold is faster than dense at small-to-moderate batch sizes and slower at l
 | 64 | 0.910× | Slower |
 | 256 | 0.599× | Slower |
 
-The highest measured speedup was **1.413×** at batch size 16. Beyond batch 32, the overhead of the two-GEMM factorized computation (extra kernel launch + intermediate tensor materialization) outweighs its FLOP savings on this runner. See "Why Low-Rank Representation Can Be Faster" for the underlying mechanism.
+The highest measured speedup was **1.413×**, at batch size 16. See section 39 for an investigation into why TensorFold is slower than dense at batch 64/256, and why that regression could not be fixed by removing kernel-dispatch overhead.
 
 ---
 
-## 23. Batch Size 16 (best-case)
+## 23. Batch Size 16 (Best Case)
 
 At batch size 16, Dense = 0.6872 ms and TensorFold = 0.4862 ms.
 
@@ -452,11 +463,35 @@ TensorFold reduced mean inference latency by approximately **29.2%** at the best
 
 ## 24. Parameter Reduction vs Speedup
 
+The benchmark demonstrates two different effects:
+
 **Parameter compression:** 535,818 → 279,940 → **47.75% parameter reduction** (holds regardless of batch size)
 
-**Inference speed:** varies by batch size, from **1.413× faster** (batch 16) to **0.599× slower** (batch 256)
+**Inference speed:** ranges from **1.413× faster** (batch 16) to **0.599× slower** (batch 256)
 
-These are genuinely different effects: parameter reduction is guaranteed by the rank/energy math, but end-to-end latency also depends on kernel-launch overhead, memory movement, and BLAS scheduling — none of which the parameter count captures. TensorFold-arm's current implementation only wins on latency in a specific batch-size regime.
+Parameter reduction and speedup are related, but they are not the same metric. Reducing the number of parameters does not guarantee a specific inference speedup on every CPU, or even a speedup at all at every batch size.
+
+---
+
+## 25. Accuracy Results
+
+| Metric | Value |
+| --- | --- |
+| Dense accuracy | 97.79% |
+| TensorFold accuracy | 97.06% |
+| Difference | -0.73 pp |
+
+The tested model therefore experienced a relatively small accuracy change while achieving substantial parameter compression. These accuracy results apply specifically to the benchmark model.
+
+---
+
+## 26. Accuracy and SVD Energy
+
+The SVD energy target and classification accuracy are separate concepts.
+
+The 90% energy target means that the selected singular components preserve at least 90% of the matrix's singular-value energy. It does **not** mean 90% classification accuracy or 90% prediction preservation.
+
+Therefore, model accuracy must always be measured independently after compression.
 
 ---
 
@@ -471,19 +506,23 @@ These are genuinely different effects: parameter reduction is guaranteed by the 
 | Dense parameters | 535,818 |
 | TensorFold parameters | 279,940 |
 | Parameter reduction | 47.75% |
-| Dense accuracy* | 97.79% |
-| TensorFold accuracy* | 97.06% |
+| Dense accuracy | 97.79% |
+| TensorFold accuracy | 97.06% |
 | Accuracy difference | -0.73 pp |
-| Best speedup | 1.413× |
-| Best speedup batch | 16 |
-| Worst-case result | 0.599× (slower) at batch 256 |
+| Maximum speedup | 1.413× |
+| Maximum speedup batch | 16 |
+| Slowest result | 0.599× (slower than dense) at batch 256 |
+| Batch 16 Dense latency | 0.6872 ms |
+| Batch 16 TensorFold latency | 0.4862 ms |
+| Approx. latency reduction (batch 16) | 29.2% |
 | CPU threads | 1 |
 | Warmup | 100 |
 | Iterations | 500 |
 | Repeats | 10 |
 | ARM64 runner | ubuntu-24.04-arm |
+| ARM64 tests | 34 passed (+ 28 for the fused-kernel investigation, section 39) |
 
-\* Accuracy was measured once, on the CPU reference run (see `x86_baseline.md`); since compression only changes the weight representation, not the hardware's arithmetic, it is not re-measured per-platform, but this should be stated explicitly rather than implied.
+---
 
 ## 28. How the Benchmark Is Implemented
 
@@ -550,7 +589,7 @@ Run the complete test suite with:
 pytest tests -v
 ```
 
-Expected result: `13 passed`
+Expected result: `34 passed`. Running `pytest tests/test_fused_backend.py -v` separately covers the fused-kernel investigation (section 39) and reports `28 passed`.
 
 The ARM64 GitHub Actions workflow executes the same test suite.
 
@@ -620,7 +659,7 @@ Therefore, the results should not be interpreted as a universal performance guar
 
 Different batch sizes exercise the CPU differently. The benchmark uses batch sizes 1, 16, 32, 64, and 256. This allows the effect of TensorFold compression to be observed across different workloads.
 
-The measured speedup increased from 1.088× at batch size 1 to 1.664× at batch size 256. This shows that the benefit of the low-rank representation can depend strongly on workload size.
+The measured speedup is 1.119× at batch size 1, peaks at 1.413× at batch size 16, and declines to 0.599× (slower than dense) at batch size 256. This shows that the benefit of the low-rank representation can depend strongly on workload size, and is not simply monotonic with batch size.
 
 ---
 
@@ -652,7 +691,7 @@ The benchmark model contains 535,818 dense parameters. After TensorFold compress
 
 The tested MNIST accuracy changes from 97.79% to 97.06%, a difference of -0.73 percentage points.
 
-On the ARM64 benchmark, the maximum measured speedup is **1.664×** at batch size 256.
+On the ARM64 benchmark, the maximum measured speedup is **1.413×** at batch size 16. TensorFold is faster than dense at batch sizes 1–32 and slower at batch sizes 64/256; see section 39 for an investigation into why, and why this project is scoped to small-to-moderate batch (on-device / mobile-inference-realistic) workloads as a result.
 
 ---
 
@@ -665,16 +704,19 @@ The TensorFold-arm benchmark pipeline is validated through:
 | Local tests | PASS |
 | ARM64 tests | PASS |
 | ARM64 benchmark | PASS |
+| Fused-kernel correctness tests | PASS |
+| Three-way benchmark (dense / torch / fused) | PASS |
 | Model loading | PASS |
 | TensorFold compression | PASS |
 
 **Headline results:**
 
-- 47.75% parameter reduction
-- Up to 1.664× ARM64 CPU inference speedup
+- 47.75% parameter reduction (holds at every batch size)
+- Up to 1.413× ARM64 CPU inference speedup at batch sizes 1–32
+- Slower than dense at batch sizes 64/256, and this was investigated (not just measured — see section 39) rather than left unexplained
 - 97.79% → 97.06% MNIST accuracy
 
-The benchmark is therefore demonstrating that the TensorFold low-rank representation can substantially reduce the parameter count and can also improve inference latency on the tested ARM64 environment.
+The benchmark demonstrates that the TensorFold low-rank representation substantially reduces parameter count on the tested ARM64 environment, and improves inference latency specifically in the small-to-moderate batch regime that matches on-device/mobile inference.
 
 ---
 
@@ -704,8 +746,18 @@ TensorFoldLinear
 ARM64 inference
 ```
 
-For the tested MNIST MLP, this resulted in **47.75% parameter reduction**, and the ARM64 benchmark measured up to **1.664× inference speedup**, while the tested accuracy changed by **-0.73 percentage points**.
+For the tested MNIST MLP, this resulted in **47.75% parameter reduction**, and the ARM64 benchmark measured up to **1.413× inference speedup** at batch sizes 1–32, while the tested accuracy changed by **-0.73 percentage points**. At batch sizes 64/256 TensorFold is slower than dense; we investigated this with a custom fused kernel (section 39) and determined the cause is not kernel-dispatch overhead but a more fundamental property of the rank/batch-size trade-off.
 
-The results demonstrate the potential of SVD-based low-rank factorization for reducing model size and improving CPU inference performance on ARM64 platforms.
+The results demonstrate the potential of SVD-based low-rank factorization for reducing model size and improving CPU inference performance on ARM64 platforms, particularly for on-device / small-batch inference workloads.
 
 > **Note:** The results are measurements from the documented benchmark configuration and should not be treated as universal performance guarantees for all models or ARM64 processors.
+
+---
+
+## 39. Investigation: A Fused CPU Kernel for the Large-Batch Regression
+
+We hypothesized the batch 64/256 regression above was caused by implementation overhead — two ATen kernel dispatches per layer instead of one, plus materializing the intermediate `[batch, rank]` tensor to memory between them — and built a custom fused CPU kernel (`tensorfold/csrc/fused_linear.cpp`) to test that hypothesis directly. It computes `(X @ A) @ B + bias` in a single pass, one dispatch, with the intermediate kept in a small per-row buffer that never touches main memory. It's exposed as `TensorFoldLinear(backend="fused")` and is correctness-tested against the original path across 5 shapes × 5 batch sizes, with/without bias (`tests/test_fused_backend.py`, 28/28 passing).
+
+Running the fused kernel through the same three-way benchmark (`benchmarks/bench_three_way.py`) falsified the hypothesis: `Torch/Dense` and `Fused/Dense` speedups track each other within ~2% at every batch size, including 64/256 where the regression is largest. Cutting the dispatch count from 6 calls per forward pass to 3 (matching dense exactly) produced no measurable change. The likely explanation: the fused kernel processes batch rows independently, giving up the batched-GEMM data reuse that both dense and the original two-matmul path benefit from, which roughly cancels out the gain from fewer dispatches. This points to the real bottleneck being the FLOP/batch-size trade-off inherent to the selected rank, not an implementation inefficiency.
+
+We kept the fused kernel and its tests in the repository as documented, working, tested code, but do not claim a latency benefit from it. `backend="torch"` (the default) remains recommended. Full writeup, including the three-way results table, is in `RESULTS.md` at the repository root.

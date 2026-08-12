@@ -1,5 +1,7 @@
 # TensorFold x86 CPU Reference
 
+> This benchmark was run manually on a local Windows/AMD64 machine, not in either CI workflow (both `ci.yml` and `arm-test.yml` run on Linux). It's included as a secondary reference point. The project's primary target platform is ARM64 — see `benchmarks/results/arm64_results.md` and `RESULTS.md` for the authoritative, CI-verified results.
+
 ## Model
 
 MNIST MLP:
@@ -33,7 +35,3 @@ Parameter reduction: 47.75%
 | 32 | 0.5031 | 0.3335 | 1.509x |
 | 64 | 0.8549 | 0.5702 | 1.499x |
 | 256 | 3.0489 | 1.9401 | 1.572x |
-
-Threads: 1
-Repeats: 10
-Iterations: 500

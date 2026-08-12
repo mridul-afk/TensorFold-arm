@@ -37,6 +37,7 @@ The project targets CPU inference on Arm64 platforms and provides an automatic m
 - [AMD64 Reference Benchmark](#amd64-reference-benchmark)
 - [Native ARM64 Benchmark](#native-arm64-benchmark)
 - [Benchmark Interpretation](#benchmark-interpretation)
+- [Investigation: A Fused CPU Kernel for the Large-Batch Regression](#investigation-a-fused-cpu-kernel-for-the-large-batch-regression)
 - [ARM64 Validation](#arm64-validation)
 - [Test Suite](#test-suite)
 - [CI Workflows](#ci-workflows)
@@ -695,6 +696,32 @@ The primary optimization target of TensorFold-arm is therefore model compression
 
 ---
 
+## Investigation: A Fused CPU Kernel for the Large-Batch Regression
+
+The benchmark above shows TensorFold is slower than dense at batch sizes 64 and 256 on ARM64. We investigated one specific hypothesis for why, built a fix, and tested it rigorously.
+
+**Hypothesis.** TensorFold's forward pass performs two matrix multiplications per layer (`(X @ A) @ B`) instead of dense's one. We hypothesized the large-batch slowdown came from implementation overhead: two separate ATen kernel dispatches per layer instead of one, plus materializing the intermediate `[batch, rank]` tensor to memory between them.
+
+**What we built.** A custom CPU kernel (`tensorfold/csrc/fused_linear.cpp`, C++/pybind11, JIT-compiled via `torch.utils.cpp_extension`) that computes `(X @ A) @ B + bias` in a single pass per layer, one dispatch, with the intermediate kept in a small per-row buffer that never touches main memory. It's available as `TensorFoldLinear(backend="fused")`, and falls back automatically to the original two-matmul path during training/autograd. Correctness was verified against the original path across 5 layer shapes × 5 batch sizes, with and without bias (`tests/test_fused_backend.py`, 28/28 passing on both Linux/GCC and Windows/MSVC).
+
+**Result: the hypothesis was falsified.** A three-way ARM64 benchmark (`benchmarks/bench_three_way.py`, dense vs. TensorFold-torch vs. TensorFold-fused) shows the fused kernel tracking the original two-matmul implementation within ~2% at every batch size — well inside measurement noise — including at batch 64/256 where the regression is largest:
+
+| Batch | Dense (ms) | TensorFold-torch (ms) | TensorFold-fused (ms) | Torch/Dense | Fused/Dense |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 0.1224 | 0.1150 | 0.1178 | 1.064× | 1.039× |
+| 16 | 0.6813 | 0.4939 | 0.4991 | 1.379× | 1.365× |
+| 32 | 0.8076 | 0.6649 | 0.6664 | 1.215× | 1.212× |
+| 64 | 0.9992 | 1.1096 | 1.1113 | 0.901× | 0.899× |
+| 256 | 2.0985 | 3.4643 | 3.4720 | 0.606× | 0.604× |
+
+Cutting the dispatch count from 6 calls per forward pass (2 matmuls × 3 layers) to 3 (matching dense's call count exactly) produced no measurable latency change.
+
+**Likely root cause.** The fused kernel computes each batch row independently (a per-row loop). Dense's single matmul and TensorFold's original two-matmul path are both *batched* GEMMs, which reuse loaded weight data across every row in the batch and get substantially better arithmetic intensity than a loop of independent per-row computations — especially as batch size grows. Fusing the two stages into one dispatch removed overhead, but computing rows independently gave up batched-GEMM efficiency; the two effects approximately cancel out. This points to the real bottleneck being more fundamental than dispatch overhead: at the rank this compression setting selects (≈246 for a 784→512 layer), the FLOP savings from the low-rank factorization aren't large enough to beat how efficiently a single dense batched GEMM scales with batch size on this hardware.
+
+We're keeping the fused kernel and its test suite in the repository — it's correct, working code — but we do not claim a latency benefit from it, and `backend="torch"` (the default) remains the recommended setting. Full writeup: `RESULTS.md`. Reproduce with `python benchmarks/bench_three_way.py`.
+
+---
+
 ## ARM64 Validation
 
 A key goal of TensorFold-arm is to ensure that the implementation and benchmarks actually work on Arm64 hardware.
@@ -767,7 +794,7 @@ The current test suite contains **34 tests**, covering:
 
 The complete test suite passes: `34 passed`
 
-The tests are executed in both the Windows AMD64 and ARM64 CI workflows.
+The tests are executed in both CI workflows: Linux x86_64 (`ci.yml`, `ubuntu-latest`) and Linux ARM64 (`arm-test.yml`, `ubuntu-24.04-arm`). The AMD64 reference numbers in `benchmarks/results/x86_baseline.md` were captured locally on Windows and are not produced by either CI workflow; treat them as a secondary reference point, not a CI-verified result.
 
 ---
 
@@ -775,7 +802,7 @@ The tests are executed in both the Windows AMD64 and ARM64 CI workflows.
 
 TensorFold-arm uses GitHub Actions for continuous validation.
 
-The project contains workflows for Windows / AMD64 and ARM64. The ARM64 workflow verifies the architecture before testing.
+The project contains two workflows: `ci.yml`, which runs on `ubuntu-latest` (Linux x86_64), and `arm-test.yml`, which runs on `ubuntu-24.04-arm` (Linux ARM64). Both use GitHub-hosted Linux runners; neither runs on Windows. The ARM64 workflow additionally verifies the architecture before testing.
 
 The CI pipeline validates:
 
@@ -837,7 +864,7 @@ depending on sensitivity.
 
 **More Arm hardware** — Benchmark on multiple ARM64 processors to determine how the factorized implementation behaves across different Arm CPU microarchitectures.
 
-**Optimized kernels** — Develop specialized kernels for `X × A` and `(X × A) × B` to reduce the overhead associated with the two-stage factorized computation.
+**Optimized kernels** — A fused single-pass CPU kernel for `(X × A) × B` was implemented and benchmarked (see "Investigation: A Fused CPU Kernel for the Large-Batch Regression" above); it did not measurably improve latency, indicating the large-batch regression is not primarily a kernel-dispatch problem. Remaining directions include a hand-written NEON-intrinsics kernel that preserves batched-GEMM-style data reuse (rather than the per-row loop tested here), or routing inference through an Arm-optimized backend such as ONNX Runtime with the XNNPACK execution provider.
 
 **Additional decompositions** — The current implementation is based on matrix SVD. Future versions could explore other low-rank and tensor decomposition approaches for higher-dimensional tensors.
 
@@ -911,7 +938,7 @@ The latest native ARM64 benchmark produced:
 
 The highest ARM64 speedup was **1.413×** at batch size 16.
 
-The results show that TensorFold's strongest consistent benefit is parameter compression, while inference acceleration depends on the workload and hardware.
+The results show that TensorFold's strongest consistent benefit is parameter compression, while inference acceleration depends on the workload and hardware. We tested and ruled out kernel-dispatch overhead as the cause of the batch 64/256 regression (see "Investigation: A Fused CPU Kernel for the Large-Batch Regression" above and `RESULTS.md`); TensorFold's speed advantage is therefore best understood as applying to small-to-moderate batch sizes (1–32), which also matches the batch-1 regime typical of on-device/mobile inference.
 
 ---
 
@@ -930,9 +957,10 @@ The project:
 - Maintains 97.06% MNIST accuracy compared with 97.79% for the dense model
 - Runs on native ARM64
 - Includes automated ARM64 architecture verification
-- Includes Windows AMD64 and ARM64 CI workflows
-- Contains 34 passing automated tests
+- Includes Linux x86_64 and Linux ARM64 CI workflows
+- Contains 34 passing automated tests, plus 28 additional tests for the fused-kernel investigation described below
 - Provides reproducible CPU benchmarks
+- Investigated and ruled out kernel-dispatch overhead as the cause of the large-batch ARM64 regression, via a custom fused kernel and a controlled three-way benchmark (see `RESULTS.md`)
 
 The benchmark results also highlight an important distinction between compression and acceleration. TensorFold can significantly reduce the parameter footprint of a model, but the factorized implementation does not automatically outperform dense matrix multiplication for every workload.
 
