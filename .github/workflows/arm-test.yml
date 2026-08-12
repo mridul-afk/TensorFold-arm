@@ -74,3 +74,7 @@ jobs:
       - name: Run fused-kernel benchmark (ARM64)
         run: |
           python benchmarks/bench_fused_local.py
+
+      - name: "Run three-way benchmark: Dense vs TensorFold-torch vs TensorFold-fused (ARM64)"
+        run: |
+          python benchmarks/bench_three_way.py
