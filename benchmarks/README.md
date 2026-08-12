@@ -411,78 +411,52 @@ The test suite passes locally and also passes in the ARM64 GitHub Actions workfl
 
 | Batch Size | Model | Mean (ms) | Median (ms) | Std (ms) | Speedup |
 | --- | --- | --- | --- | --- | --- |
-| 1 | Dense | 0.1914 | 0.1812 | 0.0252 | – |
-| 1 | TensorFold 90% | 0.1759 | 0.1747 | 0.0035 | 1.088× |
-| 16 | Dense | 0.7866 | 0.7458 | 0.0983 | – |
-| 16 | TensorFold 90% | 0.5991 | 0.6190 | 0.0801 | 1.313× |
-| 32 | Dense | 1.2195 | 1.2172 | 0.0500 | – |
-| 32 | TensorFold 90% | 0.8667 | 0.8552 | 0.0481 | 1.407× |
-| 64 | Dense | 2.1408 | 2.1345 | 0.1028 | – |
-| 64 | TensorFold 90% | 1.4104 | 1.4116 | 0.0781 | 1.518× |
-| 256 | Dense | 7.5964 | 7.5175 | 0.4200 | – |
-| 256 | TensorFold 90% | 4.5649 | 4.5699 | 0.1257 | 1.664× |
+| 1 | Dense | 0.1244 | 0.1244 | 0.0002 | – |
+| 1 | TensorFold 90% | 0.1111 | 0.1109 | 0.0012 | 1.119× |
+| 16 | Dense | 0.6872 | 0.6909 | 0.0138 | – |
+| 16 | TensorFold 90% | 0.4862 | 0.4853 | 0.0022 | 1.413× |
+| 32 | Dense | 0.7642 | 0.7602 | 0.0096 | – |
+| 32 | TensorFold 90% | 0.6319 | 0.6317 | 0.0011 | 1.209× |
+| 64 | Dense | 0.9771 | 0.9737 | 0.0150 | – |
+| 64 | TensorFold 90% | 1.0739 | 1.0737 | 0.0020 | 0.910× |
+| 256 | Dense | 2.0406 | 2.0376 | 0.0100 | – |
+| 256 | TensorFold 90% | 3.4052 | 3.4045 | 0.0048 | 0.599× |
 
 ---
 
 ## 22. ARM64 Speedup Analysis
 
-The TensorFold model was faster than the dense model at every tested batch size.
+TensorFold is faster than dense at small-to-moderate batch sizes and slower at large batch sizes:
 
-| Batch Size | Speedup |
-| --- | --- |
-| 1 | 1.088× |
-| 16 | 1.313× |
-| 32 | 1.407× |
-| 64 | 1.518× |
-| 256 | 1.664× |
+| Batch Size | Speedup | Result |
+| --- | --- | --- |
+| 1 | 1.119× | Faster |
+| 16 | 1.413× | Faster |
+| 32 | 1.209× | Faster |
+| 64 | 0.910× | Slower |
+| 256 | 0.599× | Slower |
 
-The highest measured speedup was **1.664×** at batch size 256.
+The highest measured speedup was **1.413×** at batch size 16. Beyond batch 32, the overhead of the two-GEMM factorized computation (extra kernel launch + intermediate tensor materialization) outweighs its FLOP savings on this runner. See "Why Low-Rank Representation Can Be Faster" for the underlying mechanism.
 
 ---
 
-## 23. Batch Size 256
+## 23. Batch Size 16 (best-case)
 
-At batch size 256, Dense = 7.5964 ms and TensorFold = 4.5649 ms.
+At batch size 16, Dense = 0.6872 ms and TensorFold = 0.4862 ms.
 
-The approximate latency reduction is:
+$$\frac{0.6872 - 0.4862}{0.6872} \times 100 \approx 29.2\%$$
 
-$$\frac{7.5964 - 4.5649}{7.5964} \times 100 \approx 39.9\%$$
-
-Therefore, under the tested configuration, TensorFold reduced mean inference latency by approximately **39.9%** at batch size 256.
+TensorFold reduced mean inference latency by approximately **29.2%** at the best-performing batch size (16).
 
 ---
 
 ## 24. Parameter Reduction vs Speedup
 
-The benchmark demonstrates two different effects:
+**Parameter compression:** 535,818 → 279,940 → **47.75% parameter reduction** (holds regardless of batch size)
 
-**Parameter compression:** 535,818 → 279,940 → **47.75% parameter reduction**
+**Inference speed:** varies by batch size, from **1.413× faster** (batch 16) to **0.599× slower** (batch 256)
 
-**Inference speed (batch size 256):** 7.5964 ms → 4.5649 ms → **1.664× speedup**
-
-Parameter reduction and speedup are related, but they are not the same metric. Reducing the number of parameters does not guarantee a specific inference speedup on every CPU.
-
----
-
-## 25. Accuracy Results
-
-| Metric | Value |
-| --- | --- |
-| Dense accuracy | 97.79% |
-| TensorFold accuracy | 97.06% |
-| Difference | -0.73 pp |
-
-The tested model therefore experienced a relatively small accuracy change while achieving substantial parameter compression. These accuracy results apply specifically to the benchmark model.
-
----
-
-## 26. Accuracy and SVD Energy
-
-The SVD energy target and classification accuracy are separate concepts.
-
-The 90% energy target means that the selected singular components preserve at least 90% of the matrix's singular-value energy. It does **not** mean 90% classification accuracy or 90% prediction preservation.
-
-Therefore, model accuracy must always be measured independently after compression.
+These are genuinely different effects: parameter reduction is guaranteed by the rank/energy math, but end-to-end latency also depends on kernel-launch overhead, memory movement, and BLAS scheduling — none of which the parameter count captures. TensorFold-arm's current implementation only wins on latency in a specific batch-size regime.
 
 ---
 
@@ -497,22 +471,19 @@ Therefore, model accuracy must always be measured independently after compressio
 | Dense parameters | 535,818 |
 | TensorFold parameters | 279,940 |
 | Parameter reduction | 47.75% |
-| Dense accuracy | 97.79% |
-| TensorFold accuracy | 97.06% |
+| Dense accuracy* | 97.79% |
+| TensorFold accuracy* | 97.06% |
 | Accuracy difference | -0.73 pp |
-| Maximum speedup | 1.664× |
-| Maximum speedup batch | 256 |
-| Batch 256 Dense latency | 7.5964 ms |
-| Batch 256 TensorFold latency | 4.5649 ms |
-| Approx. latency reduction | 39.9% |
+| Best speedup | 1.413× |
+| Best speedup batch | 16 |
+| Worst-case result | 0.599× (slower) at batch 256 |
 | CPU threads | 1 |
 | Warmup | 100 |
 | Iterations | 500 |
 | Repeats | 10 |
 | ARM64 runner | ubuntu-24.04-arm |
-| ARM64 tests | 13 passed |
 
----
+\* Accuracy was measured once, on the CPU reference run (see `x86_baseline.md`); since compression only changes the weight representation, not the hardware's arithmetic, it is not re-measured per-platform, but this should be stated explicitly rather than implied.
 
 ## 28. How the Benchmark Is Implemented
 

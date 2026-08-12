@@ -8,6 +8,8 @@ from .decomposition import (
 
 from .optimizer import compress
 
+from .fused_backend import fused_available
+
 
 __all__ = [
     "TensorFoldLinear",
@@ -15,4 +17,5 @@ __all__ = [
     "select_rank",
     "analyze_linear",
     "compress",
+    "fused_available",
 ]

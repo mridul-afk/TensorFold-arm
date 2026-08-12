@@ -66,3 +66,11 @@ jobs:
       - name: Run ARM64 benchmark
         run: |
           python examples/benchmark_tensorfold.py
+
+      - name: Run fused-kernel correctness tests
+        run: |
+          pytest tests/test_fused_backend.py -v
+
+      - name: Run fused-kernel benchmark (ARM64)
+        run: |
+          python benchmarks/bench_fused_local.py

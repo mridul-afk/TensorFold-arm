@@ -9,12 +9,20 @@ from .decomposition import analyze_linear
 def compress(
     model: nn.Module,
     energy: float = 0.95,
+    backend: str = "torch",
 ) -> nn.Module:
     """
     Convert beneficial nn.Linear layers into
     TensorFoldLinear layers.
 
     The original model is not modified.
+
+    backend: forward-pass backend for the created TensorFoldLinear
+        layers. "torch" (default) uses two plain matmuls. "fused"
+        uses the custom fused CPU kernel (see tensorfold/fused_backend.py)
+        which avoids materializing the intermediate [batch, rank]
+        tensor; falls back to "torch" automatically wherever it isn't
+        applicable (training mode, autograd, non-CPU, non-float32).
     """
 
     model = copy.deepcopy(model)
@@ -22,6 +30,7 @@ def compress(
     _compress_module(
         model,
         energy=energy,
+        backend=backend,
     )
 
     return model
@@ -30,6 +39,7 @@ def compress(
 def _compress_module(
     module: nn.Module,
     energy: float,
+    backend: str = "torch",
 ):
     for name, child in list(
         module.named_children()
@@ -77,6 +87,7 @@ def _compress_module(
                     TensorFoldLinear.from_linear(
                         child,
                         rank=rank,
+                        backend=backend,
                     )
                 )
 
@@ -91,4 +102,5 @@ def _compress_module(
             _compress_module(
                 child,
                 energy=energy,
+                backend=backend,
             )

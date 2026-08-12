@@ -1,5 +1,9 @@
+import warnings
+
 import torch
 import torch.nn as nn
+
+from .fused_backend import fused_available, fused_forward
 
 
 class TensorFoldLinear(nn.Module):
@@ -18,6 +22,22 @@ class TensorFoldLinear(nn.Module):
     and computes:
 
         Y = (X @ U) @ V + b
+
+    Two backends are available for the forward pass:
+
+        backend="torch" (default): two plain `@` matmuls. Correct on
+            any platform/dtype, but on CPU this pays for two separate
+            kernel dispatches and materializes the [batch, rank]
+            intermediate in memory. Benchmarks show this can be
+            *slower* than a dense nn.Linear at large batch sizes
+            (see benchmarks/results/arm64_results.md).
+
+        backend="fused": a custom CPU kernel (tensorfold/csrc/fused_linear.cpp)
+            that computes the same result in a single pass without
+            materializing the intermediate. JIT-compiled on first use.
+            Falls back to backend="torch" automatically (with a
+            warning) if compilation fails or a non-CPU/non-float32
+            tensor is passed.
     """
 
     def __init__(
@@ -26,6 +46,7 @@ class TensorFoldLinear(nn.Module):
         out_features: int,
         rank: int,
         bias: bool = True,
+        backend: str = "torch",
     ):
         super().__init__()
 
@@ -40,9 +61,15 @@ class TensorFoldLinear(nn.Module):
                 "min(in_features, out_features)"
             )
 
+        if backend not in ("torch", "fused"):
+            raise ValueError(
+                'backend must be "torch" or "fused"'
+            )
+
         self.in_features = in_features
         self.out_features = out_features
         self.rank = rank
+        self.backend = backend
 
         self.U = nn.Parameter(
             torch.empty(
@@ -90,10 +117,33 @@ class TensorFoldLinear(nn.Module):
                 bound
             )
 
+    def _can_use_fused(self, x: torch.Tensor) -> bool:
+        return (
+            self.backend == "fused"
+            and not self.training
+            and not x.requires_grad
+            and not self.U.requires_grad
+            and not self.V.requires_grad
+            and x.device.type == "cpu"
+            and x.dtype == torch.float32
+            and fused_available()
+        )
+
     def forward(
         self,
         x: torch.Tensor
     ) -> torch.Tensor:
+
+        if self._can_use_fused(x):
+            return fused_forward(x, self.U, self.V, self.bias)
+
+        if self.backend == "fused":
+            # Fused backend was requested but isn't usable for this
+            # call (training mode, autograd, non-CPU, non-fp32, or
+            # the extension failed to build). fused_backend already
+            # warns on build failure; silently fall back here so
+            # training/autograd always works.
+            pass
 
         y = x @ self.U
         y = y @ self.V
@@ -108,6 +158,7 @@ class TensorFoldLinear(nn.Module):
         cls,
         layer: nn.Linear,
         rank: int,
+        backend: str = "torch",
     ):
         """
         Convert a PyTorch nn.Linear layer into
@@ -174,6 +225,7 @@ class TensorFoldLinear(nn.Module):
             out_features=layer.out_features,
             rank=rank,
             bias=layer.bias is not None,
+            backend=backend,
         )
 
         # Copy factors

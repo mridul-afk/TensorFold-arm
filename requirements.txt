@@ -2,3 +2,4 @@ torch>=2.13
 torchvision>=0.26
 numpy>=1.26
 pytest>=8.0
+ninja
